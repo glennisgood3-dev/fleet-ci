@@ -1,0 +1,128 @@
+# fleet-dispatch —— 中央排程，一個 public 的 `fleet-ci` repo 管全部專案的站 4/5
+#
+# 安裝：放在 `fleet-ci` 的 .github/workflows/fleet-dispatch.yml
+#       🔴 `fleet-ci` 要 **public** —— public repo 的 Actions 分鐘免費無限；
+#          private 是 2,000 分/月且整個帳號共用，光這個排程就會吃掉七成。
+#
+# 需要（都只設【一次】，一輩子）：
+#   secret  DEVIN_API_KEY   Devin API key
+#   secret  FLEET_PAT       fine-grained PAT，涵蓋全部專案 repo
+#                           權限：Contents read/write ＋ Pull requests read/write
+#   var     FLEET_REPOS     逗號分隔的 owner/repo
+#                           🔴 用 **variable 不用 commit 進檔案** —— 這個 repo 是 public，
+#                              repo 名字進 git 就等於公開你有哪些專案。
+#
+# 🔴 專案 repo 需要什麼：`tickets.yml` ＋ 一個 station5-verify stub。**secret 零個。**
+#
+# 💰 計費（會被問到，先寫在這裡）：
+#   · GitHub Actions 分鐘**只在 runner 真的在跑的時候算**。本 workflow 對 Devin 是
+#     「POST 完就走」，**不等、不 poll、不 block** ⇒ Devin 做多久都與 GitHub 帳單無關。
+#   · 🚫 **絕對不要寫成「派工後 sleep 等 Devin 回」** —— 那會把 Devin 的工時
+#     一比一轉成 Actions 分鐘。本檔用排程輪詢正是為了避開它。
+#   · Devin 的工時走 Devin 自己的 ACU，與 GitHub 是兩個互不相干的計費表。
+
+name: fleet-dispatch
+
+on:
+  schedule:
+    # 每 30 分。要更即時就改 */15，但先看 exception 率再加密度 ——
+    # 並行度不由依賴圖決定，由 exception 率決定。
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      max_concurrent:
+        description: '並行上限（先壓 exception 率，再加倍）'
+        default: '3'
+      dry_run:
+        description: '只印要派什麼，不真的送'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # 兩輪排程重疊時不可以各自算一次前緣然後重複派同一張票
+  group: fleet-dispatch
+  cancel-in-progress: false
+
+env:
+  # 🔴 public repo ⇒ log 公開。腳本只印票號與計數，不印 title／派工令／session id 全文。
+  FLEET_REDACT: '1'
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pyyaml
+
+      - name: Sanity —— 設定齊了沒（fail-closed，不要靜靜地什麼都沒做）
+        env:
+          FLEET_REPOS: ${{ vars.FLEET_REPOS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLEET_REPOS:-}" ]; then
+            echo "::error::vars.FLEET_REPOS 是空的 ⇒ 沒有任何專案會被輪詢。"
+            echo "::error::到 fleet-ci → Settings → Secrets and variables → Actions → Variables 新增。"
+            exit 1
+          fi
+          echo "將輪詢 $(echo "$FLEET_REPOS" | tr ',' '\n' | grep -c .) 個 repo"
+
+      - name: 逐一算前緣並派工
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          FLEET_PAT: ${{ secrets.FLEET_PAT }}
+          FLEET_REPOS: ${{ vars.FLEET_REPOS }}
+          MAXC: ${{ github.event.inputs.max_concurrent || '3' }}
+          DRY: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -uo pipefail
+          FAILED=0
+          for REPO in $(echo "$FLEET_REPOS" | tr ',' ' '); do
+            echo "::group::$REPO"
+            rm -rf _work && mkdir -p _work
+            # 只取 tickets.yml —— **不 checkout 專案原始碼**。
+            # public runner 上不放 private 程式碼，是刻意的邊界（見檔頭）。
+            if ! git clone --no-checkout --depth 1 --filter=blob:none \
+                 "https://x-access-token:${FLEET_PAT}@github.com/${REPO}.git" _work 2>/dev/null; then
+              echo "::warning::$REPO clone 失敗（PAT 沒涵蓋？）"; FAILED=1; echo "::endgroup::"; continue
+            fi
+            git -C _work sparse-checkout init --cone >/dev/null 2>&1 || true
+            git -C _work sparse-checkout set --no-cone '/tickets.yml' >/dev/null 2>&1 || true
+            git -C _work checkout >/dev/null 2>&1 || true
+            if [ ! -f _work/tickets.yml ]; then
+              echo "::warning::$REPO 沒有 tickets.yml ⇒ 略過（要納管就在該 repo 根目錄放一份）"
+              echo "::endgroup::"; continue
+            fi
+
+            EXTRA=""; [ "${DRY:-false}" = "true" ] && EXTRA="--dry-run"
+            python3 ci/scripts/next_dispatch.py \
+              --tickets _work/tickets.yml --repo "$REPO" \
+              --max-concurrent "$MAXC" $EXTRA || FAILED=1
+
+            # 只有 tickets.yml 真的變了才 commit —— next_dispatch 是外科式改寫，
+            # 沒變動時它一個位元組都不會動 ⇒ 不會產生內容為空的假 commit。
+            if [ "${DRY:-false}" != "true" ] && ! git -C _work diff --quiet -- tickets.yml; then
+              git -C _work config user.name  "fleet-dispatch"
+              git -C _work config user.email "fleet-dispatch@users.noreply.github.com"
+              git -C _work add tickets.yml
+              git -C _work commit -q -m "chore(dispatch): 前緣更新 [skip ci]"
+              git -C _work push -q origin HEAD || { echo "::warning::$REPO push 失敗"; FAILED=1; }
+            fi
+            echo "::endgroup::"
+          done
+          exit $FAILED
+
+      - name: 掃各 repo 的 open PR，缺 manifest 就觸發 verifier
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          FLEET_PAT: ${{ secrets.FLEET_PAT }}
+          FLEET_REPOS: ${{ vars.FLEET_REPOS }}
+        run: python3 ci/scripts/fleet_poll.py --repos "$FLEET_REPOS"
