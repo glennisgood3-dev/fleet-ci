@@ -175,12 +175,33 @@ def apply_updates(text, updates):
     回傳 (新文字, 實際改了幾個欄位)。**找不到的欄位用插入，不用重寫整份。**
     """
     lines = text.split("\n")
-    # 找每張票的起訖：`- id: <ID>` 那一行到下一個同縮排的 `- ` 之前
+    # 🔴 2026-08-05 修（實測抓到）：只認 **頂層 `tickets:` 底下**的 `- id:`。
+    #    第一版對全檔掃 `- id:`，而 block style 的 `depends_on:` 長這樣：
+    #        depends_on:
+    #        - id: LOL-02
+    #          type: artifact
+    #    ⇒ **依賴邊被當成票**，於是 `LOL-04a` 出現在 5 張下游票的 depends_on 裡，
+    #      每一處都被插入一行 `status:` ⇒ 一次改動報 **12 個欄位**（正確答案是 2）。
+    #    這會把 tickets.yml 寫壞，而且壞在「看起來只是多了幾行」。
+    tickets_at = next((i for i, ln in enumerate(lines)
+                       if re.match(r"^tickets:\s*$", ln)), None)
     starts = []
-    for i, ln in enumerate(lines):
-        m = re.match(r"^(\s*)-\s+id:\s*[\"\']?([A-Za-z0-9_.-]+)", ln)
-        if m:
-            starts.append((i, len(m.group(1)), m.group(2)))
+    if tickets_at is not None:
+        item_indent = None
+        for i in range(tickets_at + 1, len(lines)):
+            ln = lines[i]
+            # ⚠️ 結束條件不能只看「非空白開頭」—— `yaml.safe_dump` 產出的清單項目
+            #    本身就在第 0 欄（`- id: LOL-01`），那樣會在第一張票就 break。
+            if re.match(r"^[^\s-]", ln):
+                break               # 下一個頂層 key ⇒ tickets 區段結束
+            m = re.match(r"^(\s*)-\s+id:\s*[\"\']?([A-Za-z0-9_.-]+)", ln)
+            if not m:
+                continue
+            indent = len(m.group(1))
+            if item_indent is None:
+                item_indent = indent
+            if indent == item_indent:   # 只收與第一張票同縮排的
+                starts.append((i, indent, m.group(2)))
     changed = 0
     for n, (i, indent, tid) in enumerate(starts):
         if tid not in updates:
@@ -326,6 +347,15 @@ def build_prompt(t, repo, manifest_doc, data=None):
     """
     data = data or {}
     scope = ", ".join(t.get("scope") or []) or "(未宣告)"
+    # 🔴 2026-08-05 新增 `branch`（實測抓到，A-9 ①自審）：
+    #    舊版把「從 origin/main 開 <ticket>-impl」寫死。
+    #    對【續作既有 PR】的票（`status_note` 明說 PR#N 開著、要修存活突變）
+    #    這句話與現實直接矛盾 —— executor 會從 main 重開一條分支，
+    #    **把既有 PR 的工作整個丟掉，而且它自己不會覺得有問題。**
+    #    ⇒ 票可以宣告 `branch:`（沿用既有分支）；沒宣告才用預設。
+    branch_line = (f"分支: **沿用既有分支 `{t['branch']}`**（不要從 main 重開）"
+                   if t.get("branch") else
+                   f"分支: 從 origin/main 開 `{t['id'].lower()}-impl`")
     contracts = "\n".join(f"  - {c}" for c in (t.get("contract_refs") or [])) or "  (無)"
     criteria = "\n".join(f"  - [ ] {c}" for c in (t.get("acceptance") or [])) or "  (見票)"
     test_cmd = resolve_test_cmd(t, data)      # validate 已 fail-closed，這裡必有值
@@ -337,7 +367,7 @@ def build_prompt(t, repo, manifest_doc, data=None):
 
     return f"""[站 4 自閉環派工] {t['id']} — {t.get('title', '')}
 repo: {repo}
-分支: 從 origin/main 開 `{t['id'].lower()}-impl`
+{branch_line}
 
 ## 要做出來的行為
 {str(t.get('what_to_build') or '(見票集)').strip()}
